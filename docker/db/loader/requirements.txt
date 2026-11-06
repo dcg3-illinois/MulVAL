@@ -1,0 +1,2 @@
+# Python deps for the snapshot loaders (docker/db/loader/*)
+PyMySQL>=1.0,<2.0

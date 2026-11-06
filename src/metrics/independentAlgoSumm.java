@@ -23,9 +23,9 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DriverManager;
-//import java.sql.ResultSet;
+import java.sql.ResultSet;
 import java.sql.SQLException;
-//import java.sql.Statement;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Hashtable;
 import java.util.Iterator;
@@ -59,6 +59,17 @@ Method:
 //nodes need to be stored at a hashtable with node id as the key and 
 //an arraylist as its status including "type", status,  
 		
+		// probability source for vuln-node conditional probabilities:
+		//   "cvss-ac" -> DB CVSS attack-complexity (h/m/l -> 0.2/0.6/0.9)
+		//   "epss"    -> DB EPSS score (0..1)
+		//   "column"  -> original behavior (last CSV column numeric value)
+		String method = "column";
+		for (int i = 0; i < args.length; i++) {
+			if (args[i].equals("-method") && i + 1 < args.length) {
+				method = args[i + 1];
+			}
+		}
+
 		//unprocessed table includes nodes haven't been processed
 		//the key is their ids and the value is an arraylist including
 		//status, type (leaf, and, or), predecessors (another string arraylist)
@@ -71,7 +82,12 @@ Method:
 		//the key of the table is the node id and the value is its metric
 		Hashtable<String, Float> processed = new Hashtable<String, Float> ();
 		
-		Hashtable<String, Float> conProb = constructConProb();
+		Hashtable<String, Float> conProb;
+		if (method.equals("cvss-ac") || method.equals("epss")) {
+			conProb = constructConProbFromDb(method);
+		} else {
+			conProb = constructConProb();
+		}
 	//	System.out.println("initialization finished");
 		//kernelAlgo is the kernel part of Wang's algorithm
 		kernelAlgo(unprocessed, processed, conProb);
@@ -142,6 +158,128 @@ Method:
 		//System.out.println("conProbTable's size is: "+ conProbTable.size());
 		return conProbTable;
 	}
+
+	/*
+	 * Construct the conditional-probability table for vuln nodes by looking up
+	 * real CVE IDs in the local MySQL database at analysis time.
+	 *
+	 * To use this path, the input factory files must reference REAL CVE IDs as
+	 * the vulnerability node ids (e.g. 'CVE-2010-0483'). The node's CVE is
+	 * extracted from its label/description (which contains a CVE reference such
+	 * as vulExists(host,'CVE-...',prog)), then resolved in the DB to a numeric
+	 * conditional probability from the requested method:
+	 *
+	 *   "cvss-ac" : maps CVSS v3 attack-complexity letter from the DB
+	 *               (h -> 0.2, m -> 0.6, l -> 0.9) - the classic Wang et al. table.
+	 *   "epss"    : uses the EPSS score (0..1) directly from the DB.
+	 *
+	 * Nodes with no CVE, or not found in the DB, fall back to their numeric value
+	 * in the last CSV column (preserving the original behavior).
+	 */
+	private static Hashtable<String, Float> constructConProbFromDb(String method) {
+
+		Hashtable<String, Float> conProbTable = new Hashtable<String, Float>();
+		// Real CVE ids: CVE-<year>-<id>. The id can be 4+ digits and the year is
+		// typically 4 digits. Matching flexibly (year \d{4}, id \d{4,}) covers
+		// both older 4-digit ids and newer longer ones (e.g. CVE-2026-12345).
+		java.util.regex.Pattern cvePat =
+			java.util.regex.Pattern.compile("CVE-\\d{4}-\\d{4,}", java.util.regex.Pattern.CASE_INSENSITIVE);
+		String line = "";
+		int index = 0;
+		String node = "";
+		String ac = "";
+		String cveId = null;
+		float conProb = 0;
+
+		try {
+			BufferedReader vertices = new BufferedReader(new FileReader("VERTICES.CSV"));
+			while ((line = vertices.readLine()) != null) {
+				String[] cols = line.split(",");
+				index = cols.length;
+				node = cols[0];               // numeric graph node id (hash key)
+				ac = cols[index - 1];         // last field (may be metric value or empty)
+
+				// Find a real CVE id anywhere in the row (usually inside the
+				// description column, e.g. vulExists(host,'CVE-2010-0483',prog)).
+				cveId = null;
+				java.util.regex.Matcher m = cvePat.matcher(line);
+				if (m.find()) {
+					cveId = m.group();
+				}
+
+				Float dbVal = (cveId != null) ? lookupCveProb(cveId, method) : null;
+				if (dbVal != null) {
+					conProb = dbVal;
+				} else {
+					// Fallback to the numeric value in the CSV column.
+					if (ac != null && !ac.trim().equals("")) {
+						try {
+							conProb = Float.parseFloat(ac);
+						} catch (NumberFormatException nfe) {
+							conProb = 0f;
+						}
+					} else {
+						conProb = 0f;
+					}
+				}
+				if (conProb > 0) {
+					conProbTable.put(node, conProb);
+				}
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return conProbTable;
+	}
+
+	/*
+	 * Look up one CVE in the DB and translate it to a numeric conditional
+	 * probability. Returns null if the CVE is not found or has no usable value.
+	 */
+	private static Float lookupCveProb(String cveId, String method) {
+		if (cveId == null || cveId.isEmpty()) {
+			return null;
+		}
+		String query;
+		if (method.equals("epss")) {
+			query = "SELECT epss_score FROM cve_lookup WHERE id='" + cveId + "'";
+		} else { // cvss-ac
+			query = "SELECT v3_attack_complexity FROM cve_lookup WHERE id='" + cveId + "'";
+		}
+		try {
+			Connection con = getConnection();
+			Statement sql = con.createStatement();
+			ResultSet result = sql.executeQuery(query);
+			if (result.next()) {
+				String val = result.getString(1);
+				con.close();
+				if (method.equals("epss")) {
+					if (val == null) {
+						return null;
+					}
+					return Float.parseFloat(val);
+				} else {
+					// cvss-ac: convert letter to classic Wang et al. value.
+					if (val == null || val.isEmpty()) {
+						return null;
+					}
+					if (val.equalsIgnoreCase("l")) {
+						return 0.9f;
+					} else if (val.equalsIgnoreCase("m")) {
+						return 0.6f;
+					} else if (val.equalsIgnoreCase("h")) {
+						return 0.2f;
+					}
+					return null;
+				}
+			}
+			con.close();
+		} catch (Exception e) {
+			return null; // DB unavailable -> caller falls back to CSV numeric value
+		}
+		return null;
+	}
+
 /*
 	//lookup ac value of cve from NVD database
 	private static String lookup_ac(String cve) {

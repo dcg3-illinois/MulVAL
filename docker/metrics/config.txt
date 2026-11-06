@@ -1,0 +1,5 @@
+# JDBC connection config read by independentAlgoSumm.java's getConnection().
+# Format: url, username, password (one per line, no trailing comma).
+jdbc:mysql://localhost:3306/cve
+root
+root
